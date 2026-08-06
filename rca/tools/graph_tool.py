@@ -1,0 +1,196 @@
+"""CRG (code-review-graph) 图谱工具集成。
+
+进程内直调 code_review_graph 的公开函数（与它的 MCP 工具同一实现），
+条件：warm-start 成功 —— CRG 已安装、且该仓库的图谱已构建/构建成功。
+图谱未就绪时工具返回 [unavailable]，让模型转用 gitGrep/gitDiff 等文本工具。
+"""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+from .. import config
+from .base import ToolSpec, register
+
+_CRG = None  # 延迟导入，未安装时优雅降级
+
+
+def _load():
+    global _CRG
+    if _CRG is None:
+        try:
+            from code_review_graph.tools import build, query, review
+
+            _CRG = {"build": build, "query": query, "review": review}
+        except ImportError:
+            _CRG = False
+    return _CRG
+
+
+def _dump(data) -> str:
+    return json.dumps(data, ensure_ascii=False, default=str)
+
+
+def _cap(text: str) -> str:
+    if len(text) > config.MAX_TOOL_OUTPUT:
+        return text[: config.MAX_TOOL_OUTPUT] + (
+            f"\n...[输出过长，已截断，共 {len(text)} 字符]"
+        )
+    return text
+
+
+def crg_built(repo: Path) -> bool:
+    """该仓库的图谱是否已构建（warm-start 检查）。"""
+    mods = _load()
+    if not mods:
+        return False
+    try:
+        db = mods["query"].get_db_path(repo)
+        return db.is_file() and db.stat().st_size > 0
+    except Exception:
+        return False
+
+
+def crg_warm_start(repo: Path, base: str | None = None) -> bool:
+    """增量更新/构建图谱（MR 场景每次 head 都可能是新的）。返回是否就绪。"""
+    mods = _load()
+    if not mods:
+        return False
+    try:
+        mods["build"].build_or_update_graph(
+            repo_root=str(repo), base=base or "HEAD~1", postprocess="minimal"
+        )
+    except Exception:
+        try:
+            mods["build"].build_or_update_graph(
+                repo_root=str(repo), full_rebuild=True, postprocess="minimal"
+            )
+        except Exception:
+            return False
+    return crg_built(repo)
+
+
+def _unavailable(reason: str) -> str:
+    return (
+        "[unavailable] 代码图谱不可用："
+        + reason
+        + "。请改用 gitGrep / gitDiff / read 等文本工具继续调查。"
+    )
+
+
+def _mods():
+    mods = _load()
+    if not mods:
+        return None
+    return mods
+
+
+def _call(fn, repo: Path, **kwargs) -> str:
+    mods = _mods()
+    if mods is None:
+        return _unavailable("未安装 code-review-graph（pip install code-review-graph）")
+    if not crg_built(repo):
+        return _unavailable(
+            "该仓库图谱未构建或 warm-start 失败（.code-review-graph/ 不存在）"
+        )
+    try:
+        result = fn(repo_root=str(repo), **kwargs)
+        return _cap(_dump(result))
+    except Exception as exc:
+        return f"[graph error] {getattr(fn, '__name__', 'query')} 失败: {exc}"
+
+
+def _graph_query(args: dict, repo: Path) -> str:
+    mods = _mods()
+    if mods is None:
+        return _unavailable("未安装 code-review-graph（pip install code-review-graph）")
+    pattern = str(args.get("pattern", "") or "").strip()
+    target = str(args.get("target", "") or "").strip()
+    if not pattern or not target:
+        return "[tool error] 缺少参数: pattern / target"
+    allowed = {
+        "callers_of", "references_to", "callees_of", "imports_of",
+        "importers_of", "children_of", "tests_for", "inheritors_of",
+        "file_summary", "interfaces",
+    }
+    if pattern not in allowed:
+        return f"[tool error] pattern 必须是以下之一: {sorted(allowed)}"
+    return _call(
+        mods["query"].query_graph,
+        repo,
+        pattern=pattern,
+        target=target,
+        max_results=int(args.get("max_results", 100) or 100),
+    )
+
+
+def _graph_impact(args: dict, repo: Path) -> str:
+    mods = _mods()
+    if mods is None:
+        return _unavailable("未安装 code-review-graph（pip install code-review-graph）")
+    files = args.get("changed_files")
+    if isinstance(files, str):
+        files = [f.strip() for f in files.split(",") if f.strip()]
+    return _call(
+        mods["query"].get_impact_radius,
+        repo,
+        changed_files=files,
+        max_depth=int(args.get("max_depth", 2) or 2),
+        base=str(args.get("base", "HEAD~1") or "HEAD~1"),
+    )
+
+
+def _graph_review(args: dict, repo: Path) -> str:
+    mods = _mods()
+    if mods is None:
+        return _unavailable("未安装 code-review-graph（pip install code-review-graph）")
+    files = args.get("changed_files")
+    if isinstance(files, str):
+        files = [f.strip() for f in files.split(",") if f.strip()]
+    return _call(
+        mods["review"].detect_changes_func,
+        repo,
+        base=str(args.get("base", "HEAD~1") or "HEAD~1"),
+        changed_files=files,
+        include_source=bool(args.get("include_source", False)),
+        max_depth=int(args.get("max_depth", 2) or 2),
+    )
+
+
+register(ToolSpec(
+    name="graph_query",
+    description="代码图谱查询（CRG）：按符号名查调用关系，pattern 可选 callers_of/callees_of/importers_of/references_to/tests_for/inheritors_of/file_summary 等。用于追踪调用链（能跨文件/跨模块，比 grep 更完整）",
+    parameters={"type": "object", "properties": {
+        "pattern": {"type": "string", "description": "查询类型，如 callers_of、callees_of、importers_of、tests_for"},
+        "target": {"type": "string", "description": "符号名/限定名/文件路径"},
+        "max_results": {"type": "integer", "description": "默认 100"},
+    }, "required": ["pattern", "target"]},
+    fn=_graph_query,
+    examples=['{"name": "graph_query", "arguments": {"pattern": "callers_of", "target": "normalizeModelRef"}}'],
+))
+
+register(ToolSpec(
+    name="graph_impact",
+    description="代码图谱爆炸半径：给定变更文件清单，返回可能受影响的调用方/依赖/测试（跨调用链传播，2 跳默认）",
+    parameters={"type": "object", "properties": {
+        "changed_files": {"type": "array", "items": {"type": "string"}, "description": "变更文件清单；省略则自动按 git 检测"},
+        "max_depth": {"type": "integer", "description": "传播跳数，默认 2"},
+        "base": {"type": "string", "description": "diff 基线 ref，默认 HEAD~1"},
+    }},
+    fn=_graph_impact,
+    examples=['{"name": "graph_impact", "arguments": {"changed_files": ["src/a.py", "src/b.ts"]}}'],
+))
+
+register(ToolSpec(
+    name="graph_review",
+    description="代码图谱风险审查：把变更映射到受影响函数/执行流/测试缺口，输出风险评分与优先审查项",
+    parameters={"type": "object", "properties": {
+        "base": {"type": "string", "description": "diff 基线 ref，默认 HEAD~1"},
+        "changed_files": {"type": "array", "items": {"type": "string"}},
+        "include_source": {"type": "boolean", "description": "是否附带源码片段，默认 false"},
+        "max_depth": {"type": "integer", "description": "默认 2"},
+    }},
+    fn=_graph_review,
+    examples=['{"name": "graph_review", "arguments": {"base": "<base_sha>"}}'],
+))
