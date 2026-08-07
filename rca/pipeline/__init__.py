@@ -9,7 +9,7 @@ from .. import config
 from ..llm import LLMClient
 from ..mr import MRContext
 from ..report import extract
-from ..repo import checkout, ensure_ref, ensure_repo, merge_base
+from ..repo import checkout, ensure_ref, ensure_repo, merge_base, remote_web_url
 from ..tools import graph_tool
 from .analyze import run_analysis
 from .classify import classify
@@ -63,7 +63,7 @@ def run_pipeline(
             print(f"[graph] warm-start 异常: {exc}")
 
     framework = framework_text(ptype)
-    raw = run_analysis(llm, repo, mr.text(), framework)
+    raw = run_analysis(llm, repo, mr.text(), framework, remote_web_url(repo))
     report = extract(raw)
 
     config.REPORT_DIR.mkdir(parents=True, exist_ok=True)

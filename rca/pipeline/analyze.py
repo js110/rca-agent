@@ -53,9 +53,15 @@ def build_system_prompt() -> str:
 
 
 def run_analysis(llm: LLMClient, repo: Path, mr_text: str,
-                 framework: str | None) -> str:
+                 framework: str | None, commit_url: str | None = None) -> str:
     system = build_system_prompt()
     user = f"## 分析框架\n\n{framework or '(无匹配框架：按系统提示词规则处理)'}\n\n{mr_text}"
+    if commit_url:
+        user += (
+            "\n\n### 提交链接\n\n"
+            f"本仓库 commit 链接前缀: {commit_url}/commit/\n"
+            "报告引用 commit 时用 markdown 链接：[短 hash](前缀 + 完整 hash)"
+        )
     messages = [
         {"role": "system", "content": system},
         {"role": "user", "content": user},
