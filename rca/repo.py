@@ -59,6 +59,15 @@ def ensure_ref(repo: Path, ref: str) -> bool:
     return False
 
 
+def merge_base(repo: Path, a: str, b: str) -> str | None:
+    """a、b 的共同祖先 sha；无法计算时返回 None。"""
+    proc = _git(repo, "merge-base", a, b)
+    if proc.returncode != 0:
+        return None
+    lines = proc.stdout.strip().splitlines()
+    return lines[0] if lines else None
+
+
 def checkout(repo: Path, ref: str) -> None:
     proc = _git(repo, "checkout", "-f", "--detach", ref)
     if proc.returncode != 0:

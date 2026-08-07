@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from . import config
+from .safety import UNTRUSTED_DECLARATION
 
 
 def _git(repo: Path, *args: str, timeout: int = 120) -> str:
@@ -53,7 +54,7 @@ class MRContext:
 
     def text(self) -> str:
         self.collect()
-        return f"""## MR 信息
+        return UNTRUSTED_DECLARATION + f"""## MR 信息
 
 - 标题: {self.title or '(无)'}
 - 描述: {self.description or '(无)'}
