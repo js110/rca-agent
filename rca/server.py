@@ -5,17 +5,21 @@ from __future__ import annotations
 import hashlib
 import hmac
 import logging
+import threading
 
 import httpx
 from fastapi import BackgroundTasks, FastAPI, Header, HTTPException, Request
 
-from . import config
+from . import config, safety, state
 from .pipeline import run_pipeline
 
 log = logging.getLogger("rca.server")
 
 PR_ACTIONS = {"opened", "synchronize", "reopened", "edited", "ready_for_review"}
 MAX_COMMENT = 60000  # GitHub 评论上限 65536，留余量
+
+# 串行化分析：避免同一仓库并发 checkout 竞争；天然形成简单队列
+_analysis_lock = threading.Lock()
 
 
 def _verify_signature(payload: bytes, sig_header: str | None) -> bool:
@@ -29,47 +33,76 @@ def _verify_signature(payload: bytes, sig_header: str | None) -> bool:
     return hmac.compare_digest(sig_header[7:], expected)
 
 
-def _post_comment(full_name: str, pr_number: int, body: str) -> None:
+def _post_comment(
+    full_name: str, pr_number: int, body: str, comment_id: int | None = None
+) -> int | None:
+    """发布/更新评论（sticky）。返回评论 id；失败返回 None。"""
     if not config.GITHUB_TOKEN:
         log.info("未配置 RCA_GITHUB_TOKEN，跳过评论回写")
-        return
-    url = f"https://api.github.com/repos/{full_name}/issues/{pr_number}/comments"
+        return None
+    body = safety.redact_secrets(body)
     if len(body) > MAX_COMMENT:
         body = body[:MAX_COMMENT] + "\n...[报告过长已截断]"
-    resp = httpx.post(
-        url,
-        headers={"Authorization": f"Bearer {config.GITHUB_TOKEN}"},
-        json={"body": body},
-        timeout=30,
+    headers = {"Authorization": f"Bearer {config.GITHUB_TOKEN}"}
+    create_url = (
+        f"https://api.github.com/repos/{full_name}/issues/{pr_number}/comments"
     )
+    if comment_id is not None:
+        url = f"https://api.github.com/repos/{full_name}/issues/comments/{comment_id}"
+        resp = httpx.patch(url, headers=headers, json={"body": body}, timeout=30)
+        if resp.status_code == 404:
+            resp = httpx.post(create_url, headers=headers,
+                              json={"body": body}, timeout=30)
+    else:
+        resp = httpx.post(create_url, headers=headers, json={"body": body},
+                          timeout=30)
     if resp.status_code >= 400:
         log.error("评论回写失败 %s: %s", resp.status_code, resp.text[:500])
+        return None
+    data = resp.json()
+    return data.get("id")
 
 
 def _handle_pr(payload: dict) -> None:
-    try:
-        pr = payload["pull_request"]
-        repo = payload["repository"]
-        head_sha = pr["head"]["sha"]
-        base_sha = pr["base"]["sha"]
-        title = pr.get("title") or ""
-        body = pr.get("body") or ""
-        result = run_pipeline(
-            repo_url=repo["clone_url"],
-            base_ref=base_sha,
-            head_ref=head_sha,
-            title=title,
-            description=body,
-        )
+    pr = payload["pull_request"]
+    repo = payload["repository"]
+    full_name = repo["full_name"]
+    pr_number = pr["number"]
+    head_sha = pr["head"]["sha"]
+    base_sha = pr["base"]["sha"]
+    title = pr.get("title") or ""
+    body = pr.get("body") or ""
+
+    with _analysis_lock:
+        st = state.get(full_name, pr_number)
+        if st and st["head_sha"] == head_sha:
+            log.info("跳过 %s #%d：head_sha %s 已分析过",
+                     full_name, pr_number, head_sha[:10])
+            return
+        try:
+            result = run_pipeline(
+                repo_url=repo["clone_url"],
+                base_ref=base_sha,
+                head_ref=head_sha,
+                title=title,
+                description=body,
+            )
+        except Exception as exc:
+            log.exception("PR 分析失败: %s", exc)
+            return
         report = result["report"]
-        log.info("分析完成 type=%s duration=%ss", result["type"], result["duration"])
+        log.info("分析完成 type=%s duration=%ss",
+                 result["type"], result["duration"])
         header = (
             f"### RCA Agent 分析报告（类型: {result['type']}）\n\n"
             f"---\n\n"
         )
-        _post_comment(repo["full_name"], pr["number"], header + report)
-    except Exception as exc:
-        log.exception("PR 分析失败: %s", exc)
+        comment_id = _post_comment(
+            full_name, pr_number, header + report,
+            comment_id=st["comment_id"] if st else None,
+        )
+        if comment_id is not None:
+            state.put(full_name, pr_number, head_sha, comment_id)
 
 
 def create_app() -> FastAPI:

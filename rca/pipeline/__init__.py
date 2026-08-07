@@ -9,7 +9,7 @@ from .. import config
 from ..llm import LLMClient
 from ..mr import MRContext
 from ..report import extract
-from ..repo import checkout, ensure_ref, ensure_repo
+from ..repo import checkout, ensure_ref, ensure_repo, merge_base
 from ..tools import graph_tool
 from .analyze import run_analysis
 from .classify import classify
@@ -35,8 +35,16 @@ def run_pipeline(
             raise RuntimeError(f"无法获取 ref: {ref}")
     checkout(repo, head_ref)
 
+    # A2: diff 口径用 merge-base，而非 base 分支最新 tip
+    # （base 分支在本 PR 创建后可能有新提交，base.sha..head 会混入无关变更）
+    diff_base = base_ref
+    mb = merge_base(repo, base_ref, head_ref)
+    if mb and mb != base_ref:
+        diff_base = mb
+        print(f"[diff] base={base_ref[:10]} 非 merge-base，改用 {mb[:10]}")
+
     mr = MRContext(
-        repo_path=repo, base_ref=base_ref, head_ref=head_ref,
+        repo_path=repo, base_ref=diff_base, head_ref=head_ref,
         title=title, description=description,
     )
     mr.collect()
