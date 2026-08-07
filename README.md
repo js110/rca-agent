@@ -1,6 +1,6 @@
 # rca-agent
 
-MR 根因分析智能体：接收 GitHub PR webhook，克隆/增量更新仓库，按 diff 分类 PR 类型，加载对应分析框架，用工具循环（git 工具 + code-review-graph 代码图谱）自动调查并输出根因分析报告，回写 PR 评论。
+MR 根因分析智能体：接收 GitHub PR webhook，克隆/增量更新仓库，按 diff 分类 PR 类型，加载对应分析框架，用工具循环（git 工具 + code-review-graph 代码图谱，测试注释）自动调查并输出根因分析报告，回写 PR 评论。
 
 ```
 GitHub webhook ──> rca-agent
