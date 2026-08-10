@@ -3,11 +3,11 @@
 from __future__ import annotations
 
 import re
-import subprocess
 from pathlib import Path
 
 from .. import config
-from .base import ToolSpec, register
+from ..repo import run_git
+from .base import ToolError, ToolSpec, register
 
 LOCK_SUFFIXES = (
     ".lock", "package-lock.json", "pnpm-lock.yaml", "yarn.lock",
@@ -17,22 +17,13 @@ LOCK_SUFFIXES = (
 
 
 def _git(repo: Path, *args: str, timeout: int = 120) -> str:
-    proc = subprocess.run(
-        [config.GIT_BINARY, "-C", str(repo), *args],
-        capture_output=True, text=True, encoding="utf-8", errors="replace",
-        timeout=timeout,
-    )
+    """跑 git 并返回 stdout;失败抛 ToolError(由 execute_tool 出口统一渲染)。"""
+    proc = run_git(repo, *args, timeout=timeout)
     if proc.returncode != 0:
-        return f"[git error] {' '.join(args[:2])}...: {proc.stderr.strip()[:2000]}"
-    return proc.stdout
-
-
-def _cap(text: str) -> str:
-    if len(text) > config.MAX_TOOL_OUTPUT:
-        return text[: config.MAX_TOOL_OUTPUT] + (
-            f"\n...[输出过长，已截断，共 {len(text)} 字符]"
+        raise ToolError(
+            f"git {' '.join(args[:2])}... 失败: {proc.stderr.strip()[:2000]}"
         )
-    return text
+    return proc.stdout
 
 
 def _is_lock_file(rel: str) -> bool:
@@ -56,12 +47,12 @@ def _git_log(args: dict, repo: Path) -> str:
         cmd.append(f"--since={args['since']}")
     if args.get("until"):
         cmd.append(f"--until={args['until']}")
-    n = int(args.get("max_count", 30) or 30)
+    n = args.get("max_count", 30) or 30
     cmd += ["-n", str(min(max(n, 1), config.MAX_LOG_ENTRIES))]
     path = str(args.get("path", "") or "").strip()
     if path:
         cmd += ["--", path]
-    return _cap(_git(repo, *cmd))
+    return _git(repo, *cmd)
 
 
 # ---------- gitDiff ----------
@@ -69,8 +60,6 @@ def _git_log(args: dict, repo: Path) -> str:
 def _git_diff(args: dict, repo: Path) -> str:
     base = str(args.get("base_ref", "") or "").strip()
     head = str(args.get("head_ref", "") or "").strip()
-    if not base or not head:
-        return "[tool error] 缺少参数: base_ref / head_ref"
     cmd = ["diff", base, head]
     path = str(args.get("path", "") or "").strip()
     if path:
@@ -78,7 +67,7 @@ def _git_diff(args: dict, repo: Path) -> str:
     out = _git(repo, *cmd)
     if args.get("stat"):
         out = _git(repo, "diff", "--stat", base, head, *(["--", path] if path else [])) + "\n\n" + out
-    return _cap(out)
+    return out
 
 
 # ---------- gitShow ----------
@@ -86,32 +75,26 @@ def _git_diff(args: dict, repo: Path) -> str:
 def _git_show(args: dict, repo: Path) -> str:
     ref = str(args.get("ref", "") or "").strip()
     mode = str(args.get("mode", "diff") or "diff")
-    if not ref:
-        return "[tool error] 缺少参数: ref"
     if mode == "snapshot":
         path = str(args.get("path", "") or "").strip()
         if not path:
-            return "[tool error] snapshot 模式需要 path 参数"
-        return _cap(_git(repo, "show", f"{ref}:{path}"))
+            raise ToolError("snapshot 模式需要 path 参数")
+        return _git(repo, "show", f"{ref}:{path}")
     if mode == "files":
-        return _cap(_git(repo, "diff-tree", "--no-commit-id", "--name-status", "-r", ref))
-    return _cap(_git(repo, "show", "--stat", "--date=short", ref))
+        return _git(repo, "diff-tree", "--no-commit-id", "--name-status", "-r", ref)
+    return _git(repo, "show", "--stat", "--date=short", ref)
 
 
 # ---------- gitGrep ----------
 
 def _git_grep(args: dict, repo: Path) -> str:
     pattern = str(args.get("pattern", "") or "").strip()
-    if not pattern:
-        return "[tool error] 缺少参数: pattern"
     cmd = ["grep", "-n", "-I", "-e", pattern]
     path = str(args.get("path", "") or "").strip()
     if path:
         cmd.append("--")
         cmd.append(path)
     out = _git(repo, *cmd)
-    if out.startswith("[git error]"):
-        return out
     lines = []
     for line in out.splitlines():
         try:
@@ -138,17 +121,13 @@ _BLAME_RE = re.compile(r"^([0-9a-f^]+)\s+\((.*?)\)\s*(.*)$", re.S)
 
 def _git_blame(args: dict, repo: Path) -> str:
     path = str(args.get("path", "") or "").strip()
-    if not path:
-        return "[tool error] 缺少参数: path"
     cmd = ["blame", "--date=short", "-w", "--"]
-    start = int(args.get("start_line", 0) or 0)
-    end = int(args.get("end_line", 0) or 0)
+    start = args.get("start_line", 0) or 0
+    end = args.get("end_line", 0) or 0
     if start:
         cmd += ["-L", f"{start},{end if end >= start else start}"]
     cmd.append(path)
     out = _git(repo, *cmd)
-    if out.startswith("[git error]"):
-        return out
     groups: list[tuple[str, list[tuple[int, str]]]] = []
     cur_sha = None
     cur_lines: list[tuple[int, str]] = []
@@ -179,15 +158,13 @@ def _git_blame(args: dict, repo: Path) -> str:
         parts.append(f"commit {sha}  {author}  {date}")
         for lineno, code in lines:
             parts.append(f"  L{lineno}: {code}")
-    return _cap("\n".join(parts))
+    return "\n".join(parts)
 
 
 # ---------- gitPickaxe ----------
 
 def _git_pickaxe(args: dict, repo: Path) -> str:
     pattern = str(args.get("pattern", "") or "").strip()
-    if not pattern:
-        return "[tool error] 缺少参数: pattern"
     cmd = [
         "log", "--oneline", "--date=short",
         "--pretty=format:%h %ad %an %s",
@@ -202,16 +179,14 @@ def _git_pickaxe(args: dict, repo: Path) -> str:
     path = str(args.get("path", "") or "").strip()
     if path:
         cmd += ["--", path]
-    return _cap(_git(repo, *cmd))
+    return _git(repo, *cmd)
 
 
 # ---------- gitShowStat ----------
 
 def _git_show_stat(args: dict, repo: Path) -> str:
     ref = str(args.get("ref", "") or "").strip()
-    if not ref:
-        return "[tool error] 缺少参数: ref"
-    return _cap(_git(repo, "show", "--stat", "--date=short", "--format=%h %ad %an %s", ref))
+    return _git(repo, "show", "--stat", "--date=short", "--format=%h %ad %an %s", ref)
 
 
 register(ToolSpec(

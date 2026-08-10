@@ -11,15 +11,24 @@ import httpx
 from fastapi import BackgroundTasks, FastAPI, Header, HTTPException, Request
 
 from . import config, safety, state
+from .checkout import cleanup as cleanup_worktree
 from .pipeline import run_pipeline
 
 log = logging.getLogger("rca.server")
 
 PR_ACTIONS = {"opened", "synchronize", "reopened", "edited", "ready_for_review"}
+CLOSE_ACTIONS = {"closed"}
 MAX_COMMENT = 60000  # GitHub 评论上限 65536，留余量
 
-# 串行化分析：避免同一仓库并发 checkout 竞争；天然形成简单队列
-_analysis_lock = threading.Lock()
+# 按 (repo, branch) 串行化分析：同一分支并发 checkout 竞争由 worktree 文件锁兜底；
+# 不同分支走不同 worktree，天然并行。
+_branch_locks_guard = threading.Lock()
+_branch_locks: dict[tuple[str, str], threading.Lock] = {}
+
+
+def _branch_lock(full_name: str, branch: str) -> threading.Lock:
+    with _branch_locks_guard:
+        return _branch_locks.setdefault((full_name, branch), threading.Lock())
 
 
 def _verify_signature(payload: bytes, sig_header: str | None) -> bool:
@@ -63,6 +72,22 @@ def _post_comment(
     return data.get("id")
 
 
+def _cleanup_pr(payload: dict) -> None:
+    """PR 关闭/合并：清理该分支的 codegraph worktree + 索引（best-effort）。
+
+    布局是 checkout 模块的私有知识：这里只传 repo_url + branch，
+    不会触发任何 git 操作（不 fetch）。
+    """
+    try:
+        pr = payload["pull_request"]
+        branch = pr["head"]["ref"]
+        repo_url = payload["repository"]["clone_url"]
+    except Exception as exc:
+        log.warning("清理 worktree 失败（payload 不完整）: %s", exc)
+        return
+    cleanup_worktree(repo_url, branch)
+
+
 def _handle_pr(payload: dict) -> None:
     pr = payload["pull_request"]
     repo = payload["repository"]
@@ -70,10 +95,16 @@ def _handle_pr(payload: dict) -> None:
     pr_number = pr["number"]
     head_sha = pr["head"]["sha"]
     base_sha = pr["base"]["sha"]
+    branch = pr["head"]["ref"]
     title = pr.get("title") or ""
     body = pr.get("body") or ""
+    action = payload.get("action", "")
 
-    with _analysis_lock:
+    if action in CLOSE_ACTIONS:
+        _cleanup_pr(payload)
+        return
+
+    with _branch_lock(full_name, branch):
         st = state.get(full_name, pr_number)
         if st and st["head_sha"] == head_sha:
             log.info("跳过 %s #%d：head_sha %s 已分析过",
@@ -86,6 +117,7 @@ def _handle_pr(payload: dict) -> None:
                 head_ref=head_sha,
                 title=title,
                 description=body,
+                branch=branch,
             )
         except Exception as exc:
             log.exception("PR 分析失败: %s", exc)
@@ -126,7 +158,7 @@ def create_app() -> FastAPI:
             return {"status": "ignored", "event": x_github_event}
         data = await request.json()
         action = data.get("action", "")
-        if action not in PR_ACTIONS:
+        if action not in PR_ACTIONS and action not in CLOSE_ACTIONS:
             return {"status": "ignored", "action": action}
         background.add_task(_handle_pr, data)
         return {"status": "accepted", "pr": data.get("number"),

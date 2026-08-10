@@ -1,19 +1,24 @@
-"""管线编排：分类 → 分派 → 图谱 warm-start → 分析 → 报告。"""
+"""管线编排：分类 → 分派 → 图谱（worktree 索引）→ 分析 → 报告。"""
 
 from __future__ import annotations
 
+import logging
 import time
 from pathlib import Path
 
 from .. import config
+from ..checkout import prepare
 from ..llm import LLMClient
 from ..mr import MRContext
-from ..report import extract
-from ..repo import checkout, ensure_ref, ensure_repo, merge_base, remote_web_url
+from ..mr_prompt import render_mr_text
+from ..report import extract_and_save
+from ..repo import ensure_ref, merge_base, remote_web_url
 from ..tools import graph_tool
 from .analyze import run_analysis
 from .classify import classify
 from .dispatch import framework_text
+
+log = logging.getLogger("rca.pipeline")
 
 
 def run_pipeline(
@@ -24,24 +29,30 @@ def run_pipeline(
     description: str = "",
     ptype: str | None = None,
     workspace: Path | None = None,
+    branch: str | None = None,
 ) -> dict:
-    """执行完整管线，返回 {type, report, repo_path, duration}。"""
+    """执行完整管线，返回 {type, report, repo_path, duration}。
+
+    branch 提供时（webhook 场景）走「每分支 worktree + 独立 codegraph 索引」方案，
+    索引严格等于 head_ref 指向的 commit；失败由 checkout 模块自动回退单 clone。
+    """
     t0 = time.time()
     llm = LLMClient()
-    repo = ensure_repo(repo_url, workspace)
 
-    for ref in (base_ref, head_ref):
-        if not ensure_ref(repo, ref):
-            raise RuntimeError(f"无法获取 ref: {ref}")
-    checkout(repo, head_ref)
+    # A1: 准备可分析工作区（检出 head_ref；worktree 失败自动回退单 clone）
+    pc = prepare(repo_url, head_ref, branch=branch, index=True, workspace=workspace)
+    repo = pc.path
+    log.info("checkout 就绪: %s (used_worktree=%s)", repo, pc.used_worktree)
 
     # A2: diff 口径用 merge-base，而非 base 分支最新 tip
     # （base 分支在本 PR 创建后可能有新提交，base.sha..head 会混入无关变更）
+    if not ensure_ref(repo, base_ref):
+        raise RuntimeError(f"无法获取 ref: {base_ref}")
     diff_base = base_ref
     mb = merge_base(repo, base_ref, head_ref)
     if mb and mb != base_ref:
         diff_base = mb
-        print(f"[diff] base={base_ref[:10]} 非 merge-base，改用 {mb[:10]}")
+        log.info("base=%s 非 merge-base，改用 %s", base_ref[:10], mb[:10])
 
     mr = MRContext(
         repo_path=repo, base_ref=diff_base, head_ref=head_ref,
@@ -53,26 +64,20 @@ def run_pipeline(
         ptype = classify(llm, mr)
     print(f"[classify] {ptype}")
 
+    # A3: 图谱 warm-start 作用在分析工作区上（worktree 时即该分支的独立索引，
+    # 保证图谱 == head_ref 的代码；单 clone 场景等价于原 base 行为）
     if config.CRG_AUTOBUILD:
         try:
             if graph_tool.crg_warm_start(repo, base_ref):
-                print("[graph] warm-start 成功（图谱已就绪）")
+                log.info("warm-start 成功（图谱已就绪）")
             else:
-                print("[graph] warm-start 失败，图谱工具将返回 unavailable")
+                log.info("warm-start 失败，图谱工具将返回 unavailable")
         except Exception as exc:
-            print(f"[graph] warm-start 异常: {exc}")
+            log.info("warm-start 异常: %s", exc)
 
     framework = framework_text(ptype)
-    raw = run_analysis(llm, repo, mr.text(), framework, remote_web_url(repo))
-    report = extract(raw)
-
-    config.REPORT_DIR.mkdir(parents=True, exist_ok=True)
-    out = config.REPORT_DIR / f"{repo.name}-{head_ref[:10]}.md"
-    out.write_text(
-        f"# RCA Report\n\n- repo: {repo_url}\n- type: {ptype}\n"
-        f"- base: {base_ref}\n- head: {head_ref}\n\n---\n\n{report}",
-        encoding="utf-8",
-    )
+    raw = run_analysis(llm, repo, render_mr_text(mr), framework, remote_web_url(repo))
+    report, out = extract_and_save(raw, repo.name, base_ref, head_ref, ptype, repo_url)
     return {
         "type": ptype,
         "report": report,

@@ -2,7 +2,8 @@
 
 进程内直调 code_review_graph 的公开函数（与它的 MCP 工具同一实现），
 条件：warm-start 成功 —— CRG 已安装、且该仓库的图谱已构建/构建成功。
-图谱未就绪时工具返回 [unavailable]，让模型转用 gitGrep/gitDiff 等文本工具。
+图谱未就绪时工具返回 [unavailable] 状态信号，让模型转用 gitGrep/gitDiff 等文本工具
+（unavailable 与 [tool error] 语义不同：前者是降级提示，不是错误）。
 """
 
 from __future__ import annotations
@@ -10,8 +11,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from .. import config
-from .base import ToolSpec, register
+from .base import ToolError, ToolSpec, register
 
 _CRG = None  # 延迟导入，未安装时优雅降级
 
@@ -30,14 +30,6 @@ def _load():
 
 def _dump(data) -> str:
     return json.dumps(data, ensure_ascii=False, default=str)
-
-
-def _cap(text: str) -> str:
-    if len(text) > config.MAX_TOOL_OUTPUT:
-        return text[: config.MAX_TOOL_OUTPUT] + (
-            f"\n...[输出过长，已截断，共 {len(text)} 字符]"
-        )
-    return text
 
 
 def crg_built(repo: Path) -> bool:
@@ -79,82 +71,74 @@ def _unavailable(reason: str) -> str:
     )
 
 
-def _mods():
+def _call(attr: str, repo: Path, **kwargs) -> str:
+    """执行 CRG 函数:未安装/图谱未构建 → unavailable 降级信号,异常 → ToolError。
+
+    attr 为 mods 字典内的点分路径,如 "query.query_graph" / "review.detect_changes_func"。
+    """
     mods = _load()
     if not mods:
-        return None
-    return mods
-
-
-def _call(fn, repo: Path, **kwargs) -> str:
-    mods = _mods()
-    if mods is None:
         return _unavailable("未安装 code-review-graph（pip install code-review-graph）")
+    parts = attr.split(".")
+    fn = mods[parts[0]]  # mods 是 dict;其值是模块,后续层用属性访问
+    for part in parts[1:]:
+        fn = getattr(fn, part)
     if not crg_built(repo):
         return _unavailable(
             "该仓库图谱未构建或 warm-start 失败（.code-review-graph/ 不存在）"
         )
     try:
         result = fn(repo_root=str(repo), **kwargs)
-        return _cap(_dump(result))
+        return _dump(result)
     except Exception as exc:
-        return f"[graph error] {getattr(fn, '__name__', 'query')} 失败: {exc}"
+        raise ToolError(f"{attr.rsplit('.', 1)[-1]} 失败: {exc}") from exc
+
+
+def _changed_files(args: dict) -> list | None:
+    """changed_files 参数清洗:CSV 字符串 → list(validate 只做 schema 校验)。"""
+    files = args.get("changed_files")
+    if isinstance(files, str):
+        return [f.strip() for f in files.split(",") if f.strip()]
+    return files
 
 
 def _graph_query(args: dict, repo: Path) -> str:
-    mods = _mods()
-    if mods is None:
-        return _unavailable("未安装 code-review-graph（pip install code-review-graph）")
     pattern = str(args.get("pattern", "") or "").strip()
     target = str(args.get("target", "") or "").strip()
-    if not pattern or not target:
-        return "[tool error] 缺少参数: pattern / target"
     allowed = {
         "callers_of", "references_to", "callees_of", "imports_of",
         "importers_of", "children_of", "tests_for", "inheritors_of",
         "file_summary", "interfaces",
     }
     if pattern not in allowed:
-        return f"[tool error] pattern 必须是以下之一: {sorted(allowed)}"
+        raise ToolError(f"pattern 必须是以下之一: {sorted(allowed)}")
     return _call(
-        mods["query"].query_graph,
+        "query.query_graph",
         repo,
         pattern=pattern,
         target=target,
-        max_results=int(args.get("max_results", 100) or 100),
+        max_results=args.get("max_results", 100),
     )
 
 
 def _graph_impact(args: dict, repo: Path) -> str:
-    mods = _mods()
-    if mods is None:
-        return _unavailable("未安装 code-review-graph（pip install code-review-graph）")
-    files = args.get("changed_files")
-    if isinstance(files, str):
-        files = [f.strip() for f in files.split(",") if f.strip()]
     return _call(
-        mods["query"].get_impact_radius,
+        "query.get_impact_radius",
         repo,
-        changed_files=files,
-        max_depth=int(args.get("max_depth", 2) or 2),
+        changed_files=_changed_files(args),
+        max_depth=args.get("max_depth", 2),
         base=str(args.get("base", "HEAD~1") or "HEAD~1"),
     )
 
 
 def _graph_review(args: dict, repo: Path) -> str:
-    mods = _mods()
-    if mods is None:
-        return _unavailable("未安装 code-review-graph（pip install code-review-graph）")
-    files = args.get("changed_files")
-    if isinstance(files, str):
-        files = [f.strip() for f in files.split(",") if f.strip()]
     return _call(
-        mods["review"].detect_changes_func,
+        "review.detect_changes_func",
         repo,
         base=str(args.get("base", "HEAD~1") or "HEAD~1"),
-        changed_files=files,
+        changed_files=_changed_files(args),
         include_source=bool(args.get("include_source", False)),
-        max_depth=int(args.get("max_depth", 2) or 2),
+        max_depth=args.get("max_depth", 2),
     )
 
 

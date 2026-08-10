@@ -9,9 +9,8 @@ from pathlib import Path
 
 from .. import config
 from ..llm import LLMClient
+from ..report import REPORT_START
 from ..tools import execute_tool, protocol_text
-
-REPORT_START = "<!--RCA-REPORT-START-->"
 
 _CALL_RE = re.compile(
     r"TOOL_CALL\s*(\{[^{}]*?(?:\{[^{}]*\}[^{}]*?)*\})", re.DOTALL
