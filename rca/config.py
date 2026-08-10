@@ -38,6 +38,13 @@ MAX_GREP_MATCHES = int(_get("RCA_MAX_GREP_MATCHES", "500"))
 MAX_LOG_ENTRIES = int(_get("RCA_MAX_LOG_ENTRIES", "100"))
 CRG_AUTOBUILD = _get("RCA_CRG_AUTOBUILD", "1") in ("1", "true", "yes", "on")
 
+# CodeGraph 索引（每分支 worktree + 独立索引，保证索引 == PR head SHA）
+CODEGRAPH_ENABLED = _get("RCA_CODEGRAPH_ENABLED", "1") in ("1", "true", "yes", "on")
+CODEGRAPH_BINARY = _get("RCA_CODEGRAPH_BINARY", "codegraph")
+CODEGRAPH_INIT_TIMEOUT = int(_get("RCA_CODEGRAPH_INIT_TIMEOUT", "3600"))
+CODEGRAPH_SYNC_TIMEOUT = int(_get("RCA_CODEGRAPH_SYNC_TIMEOUT", "3600"))
+CODEGRAPH_WT_MAX_COUNT = int(_get("RCA_CODEGRAPH_WT_MAX_COUNT", "20"))
+
 # Webhook / GitHub
 WEBHOOK_SECRET = _get("RCA_WEBHOOK_SECRET")
 GITHUB_TOKEN = _get("RCA_GITHUB_TOKEN")

@@ -29,8 +29,10 @@ def pr_payload() -> dict:
             "title": "fix precision",
             "body": "修复 float 精度",
             "number": 7,
-            "head": {"sha": "9e895710bab318f493b4a54aeb97ee209c1eb7c7"},
-            "base": {"sha": "6ad7e2e27c32189b14483a970d8e78944704689b"},
+            "head": {"sha": "9e895710bab318f493b4a54aeb97ee209c1eb7c7",
+                     "ref": "bugfix/precision"},
+            "base": {"sha": "6ad7e2e27c32189b14483a970d8e78944704689b",
+                     "ref": "main"},
         },
         "repository": {"clone_url": "https://github.com/js110/demo.git",
                        "full_name": "js110/demo"},
@@ -63,12 +65,12 @@ r = client.post("/webhook/github", content=json.dumps({"action": "pushed"}).enco
                          "X-Hub-Signature-256": sig(json.dumps({"action": "pushed"}).encode())})
 assert r.json()["status"] == "ignored", r.text
 
-# 忽略的 PR action → ignored
+# closed 在 CLOSE_ACTIONS 中：被接受（触发后台 worktree 清理）
 p = pr_payload()
 p["action"] = "closed"
 r = client.post("/webhook/github", content=json.dumps(p).encode(),
                 headers={"X-GitHub-Event": "pull_request",
                          "X-Hub-Signature-256": sig(json.dumps(p).encode())})
-assert r.json()["status"] == "ignored", r.text
+assert r.json()["status"] == "accepted", r.text
 
 print("PASS  server e2e")

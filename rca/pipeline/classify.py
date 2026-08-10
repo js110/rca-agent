@@ -7,6 +7,7 @@ import re
 from .. import config
 from ..llm import LLMClient
 from ..mr import MRContext
+from ..mr_prompt import render_mr_text
 
 VALID_TYPES = {"bugfix", "feature", "refactor", "perf", "config", "other"}
 
@@ -25,7 +26,7 @@ def _template_parts() -> tuple[str, str]:
 
 def classify(llm: LLMClient, mr: MRContext) -> str:
     system, user_template = _template_parts()
-    user = user_template + "\n\n" + mr.text()
+    user = user_template + "\n\n" + render_mr_text(mr)
     messages = [
         {"role": "system", "content": system},
         {"role": "user", "content": user},

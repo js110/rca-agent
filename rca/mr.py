@@ -1,21 +1,21 @@
-"""MR 上下文收集：标题/描述/变更文件统计/提交日志/diff，组装「节省上下文」section。"""
+"""MR 证据收集：变更文件 / 提交日志 / diff / 统计等仓库事实。
+
+只负责从 git 收集结构化证据，不含任何提示词/渲染逻辑；
+把证据组装成给 LLM 的 MR 上下文文本见 mr_prompt 模块（提示词渲染）。
+"""
 
 from __future__ import annotations
 
-import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from . import config
-from .safety import UNTRUSTED_DECLARATION
+from .repo import run_git
 
 
 def _git(repo: Path, *args: str, timeout: int = 120) -> str:
-    proc = subprocess.run(
-        [config.GIT_BINARY, "-C", str(repo), *args],
-        capture_output=True, text=True, encoding="utf-8", errors="replace",
-        timeout=timeout,
-    )
+    """跑 git 并返回 stdout;失败返回错误串(不抛,让证据字段保留可读内容)。"""
+    proc = run_git(repo, *args, timeout=timeout)
     if proc.returncode != 0:
         return f"[git error] {proc.stderr.strip()[:1000]}"
     return proc.stdout
@@ -23,6 +23,8 @@ def _git(repo: Path, *args: str, timeout: int = 120) -> str:
 
 @dataclass
 class MRContext:
+    """MR 的事实集合：仓库定位 + 输入信息（标题/描述）+ 收集到的证据。"""
+
     repo_path: Path
     base_ref: str
     head_ref: str
@@ -51,27 +53,3 @@ class MRContext:
         self.diff = diff
         self._collected = True
         return self
-
-    def text(self) -> str:
-        self.collect()
-        return UNTRUSTED_DECLARATION + f"""## MR 信息
-
-- 标题: {self.title or '(无)'}
-- 描述: {self.description or '(无)'}
-- 基线(base): {self.base_ref}
-- 变更(head): {self.head_ref}
-
-## 节省上下文（已收集，无需用 gitPickaxe / gitBlame 重复拉取）
-
-### 变更文件（git diff --stat {self.base_ref}..{self.head_ref}）
-{self.file_stats or '(空)'}
-
-### 变更文件清单
-{self.changed_files or '(空)'}
-
-### 提交日志（base..head）
-{self.commit_log or '(空)'}
-
-### 完整 diff（截断上限 {config.MAX_DIFF_CHARS} 字符）
-{self.diff or '(空)'}
-"""

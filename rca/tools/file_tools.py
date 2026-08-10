@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from .base import ToolSpec, register
+from .base import ToolError, ToolSpec, register
 
 MAX_MATCHES = 500
 
@@ -12,21 +12,19 @@ MAX_MATCHES = 500
 def _safe_path(repo: Path, rel: str) -> Path:
     p = (repo / rel).resolve()
     if not p.is_relative_to(repo.resolve()):
-        raise ValueError(f"路径越界，只允许访问仓库内文件: {rel}")
+        raise ToolError(f"路径越界，只允许访问仓库内文件: {rel}")
     return p
 
 
 def _read(args: dict, repo: Path) -> str:
     path = str(args.get("path", "")).strip()
-    if not path:
-        return "[tool error] 缺少参数: path"
     target = _safe_path(repo, path)
     if not target.is_file():
-        return f"[tool error] 文件不存在或不是文件: {path}"
+        raise ToolError(f"文件不存在或不是文件: {path}")
     text = target.read_text(encoding="utf-8", errors="replace")
     lines = text.splitlines()
-    start = int(args.get("start_line", 1) or 1)
-    end = int(args.get("end_line", 0) or 0) or len(lines)
+    start = args.get("start_line", 1) or 1
+    end = args.get("end_line", 0) or 0 or len(lines)
     start = max(1, start)
     end = min(len(lines), max(start, end))
     numbered = [f"{i:>6}: {lines[i - 1]}" for i in range(start, end + 1)]
@@ -37,11 +35,9 @@ def _read(args: dict, repo: Path) -> str:
 def _glob(args: dict, repo: Path) -> str:
     pattern = str(args.get("pattern", "")).strip()
     base_rel = str(args.get("path", ".") or ".")
-    if not pattern:
-        return "[tool error] 缺少参数: pattern"
     base = _safe_path(repo, base_rel)
     if not base.is_dir():
-        return f"[tool error] 目录不存在: {base_rel}"
+        raise ToolError(f"目录不存在: {base_rel}")
     matches = []
     for p in base.glob(pattern):
         if ".git" in p.parts:

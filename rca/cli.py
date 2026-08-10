@@ -7,11 +7,12 @@ import json
 import sys
 
 from . import config
+from .checkout import prepare
 from .llm import LLMClient
 from .mr import MRContext
 from .pipeline import run_pipeline
 from .pipeline.classify import classify
-from .repo import checkout, ensure_ref, ensure_repo
+from .repo import ensure_ref
 
 
 def _cmd_analyze(args: argparse.Namespace) -> int:
@@ -22,6 +23,7 @@ def _cmd_analyze(args: argparse.Namespace) -> int:
         title=args.title or "",
         description=args.desc or "",
         ptype=args.type,
+        branch=args.branch,
     )
     print(result["report"])
     print(f"\n[report] 已保存: {result['report_file']}")
@@ -31,13 +33,11 @@ def _cmd_analyze(args: argparse.Namespace) -> int:
 
 def _cmd_classify(args: argparse.Namespace) -> int:
     llm = LLMClient()
-    repo = ensure_repo(args.repo)
-    for ref in (args.base, args.head):
-        if not ensure_ref(repo, ref):
-            print(f"[error] 无法获取 ref: {ref}", file=sys.stderr)
-            return 1
-    checkout(repo, args.head)
-    mr = MRContext(repo_path=repo, base_ref=args.base, head_ref=args.head,
+    pc = prepare(args.repo, args.head, index=False)
+    if not ensure_ref(pc.path, args.base):
+        print(f"[error] 无法获取 ref: {args.base}", file=sys.stderr)
+        return 1
+    mr = MRContext(repo_path=pc.path, base_ref=args.base, head_ref=args.head,
                    title=args.title or "", description=args.desc or "")
     print(classify(llm, mr))
     return 0
@@ -70,6 +70,8 @@ def main(argv: list[str] | None = None) -> int:
     p_analyze.add_argument("--desc", default="")
     p_analyze.add_argument("--type", default=None,
                            help="跳过分类，强制指定类型")
+    p_analyze.add_argument("--branch", default=None,
+                           help="PR 分支名；提供时用每分支 worktree + codegraph 索引（索引==head commit）")
     p_analyze.set_defaults(func=_cmd_analyze)
 
     p_classify = sub.add_parser("classify", help="只做分类")
